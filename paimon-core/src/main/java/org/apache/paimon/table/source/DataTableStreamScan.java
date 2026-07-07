@@ -53,7 +53,7 @@ import static org.apache.paimon.CoreOptions.ChangelogProducer.LOOKUP;
 import static org.apache.paimon.CoreOptions.StreamScanMode.FILE_MONITOR;
 
 /** {@link StreamTableScan} implementation for streaming planning. */
-public class DataTableStreamScan extends AbstractDataTableScan implements StreamDataTableScan {
+public class  DataTableStreamScan extends AbstractDataTableScan implements StreamDataTableScan {
 
     private static final Logger LOG = LoggerFactory.getLogger(DataTableStreamScan.class);
 

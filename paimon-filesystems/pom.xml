@@ -39,16 +39,16 @@
         <module>paimon-oss-impl</module>
         <module>paimon-s3</module>
         <module>paimon-s3-impl</module>
-        <module>paimon-cosn</module>
-        <module>paimon-cosn-impl</module>
-        <module>paimon-jindo</module>
-        <module>paimon-jindodls</module>
-        <module>paimon-gs</module>
-        <module>paimon-gs-impl</module>
-        <module>paimon-azure</module>
-        <module>paimon-azure-impl</module>
-        <module>paimon-obs</module>
-        <module>paimon-obs-impl</module>
+<!--        <module>paimon-cosn</module>-->
+<!--        <module>paimon-cosn-impl</module>-->
+<!--        <module>paimon-jindo</module>-->
+<!--        <module>paimon-jindodls</module>-->
+<!--        <module>paimon-gs</module>-->
+<!--        <module>paimon-gs-impl</module>-->
+<!--        <module>paimon-azure</module>-->
+<!--        <module>paimon-azure-impl</module>-->
+<!--        <module>paimon-obs</module>-->
+<!--        <module>paimon-obs-impl</module>-->
     </modules>
 
     <properties>
