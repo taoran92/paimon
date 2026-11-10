@@ -32,7 +32,7 @@ jobs:
     timeout-minutes: 60
     env:
       MAVEN_OPTS: -Xmx4g -Dmaven.wagon.http.retryHandler.count=3
-      MAVEN_REPO_LOCAL: '${{ github.workspace }}\windows dependencies #1\repository'
+      MAVEN_REPO_LOCAL: '${{ github.workspace }}\windows dependencies 1\repository'
       SUBJECT_SHA: 8ee6df7f9d097d72aad65e0191085cd370c1166f
     steps:
       - name: Configure Git paths
