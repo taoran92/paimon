@@ -50,11 +50,13 @@ jobs:
           java-version: '8'
           distribution: temurin
       - name: Cache Maven dependencies
+        id: maven-cache
         uses: actions/cache@v5
         with:
           path: ${{ env.MAVEN_REPO_LOCAL }}
           key: windows-cdc-charset-${{ hashFiles('**/pom.xml') }}
       - name: Build dependency closure
+        id: build
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force windows-validation-results | Out-Null
@@ -64,15 +66,23 @@ jobs:
             -pl paimon-flink/paimon-flink-cdc -am '-Pfast-build,flink1' `
             -DskipTests install 2>&1 | Tee-Object windows-validation-results/build.log
           if ($LASTEXITCODE -ne 0) { throw "Dependency build failed: $LASTEXITCODE" }
+      - name: Save built dependencies
+        if: steps.maven-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: ${{ env.MAVEN_REPO_LOCAL }}
+          key: windows-cdc-charset-${{ hashFiles('**/pom.xml') }}
       - name: Compare old and new launcher on JDK 8
         shell: pwsh
         run: ./.github/scripts/verify-cdc-windows.ps1 -JavaVersion 8
       - name: Set up JDK 11
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         uses: actions/setup-java@v5
         with:
           java-version: '11'
           distribution: temurin
       - name: Compare old and new launcher on JDK 11
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         shell: pwsh
         run: ./.github/scripts/verify-cdc-windows.ps1 -JavaVersion 11
       - name: Upload evidence
