@@ -16,100 +16,69 @@
 # limitations under the License.
 ################################################################################
 
-name: CI
+name: CDC charset Windows validation
 
 on:
-  pull_request:
   push:
+    branches: [fix/cdc-json-utf8-windows-validation]
   workflow_dispatch:
 
 permissions:
   contents: read
 
-concurrency:
-  group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
-
 jobs:
-  plan:
-    name: Select tests and validate CI
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    outputs:
-      java: ${{ steps.plan.outputs.java }}
-      matrix: ${{ steps.plan.outputs.matrix }}
-      python: ${{ steps.plan.outputs.python }}
-      docs: ${{ steps.plan.outputs.docs }}
-      licensing: ${{ steps.plan.outputs.licensing }}
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    env:
+      MAVEN_OPTS: -Xmx4g -Dmaven.wagon.http.retryHandler.count=3
+      MAVEN_REPO_LOCAL: '${{ github.workspace }}\windows dependencies #1\repository'
+      SUBJECT_SHA: 8ee6df7f9d097d72aad65e0191085cd370c1166f
     steps:
+      - name: Configure Git paths
+        shell: pwsh
+        run: |
+          git config --global core.longpaths true
+          git config --global core.autocrlf false
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Test CI selection and Maven commands
-        run: python3 -m unittest discover -s tools/ci -p 'test_*.py'
-      - name: Validate workflow syntax
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Set up JDK 8
+        uses: actions/setup-java@v5
+        with:
+          java-version: '8'
+          distribution: temurin
+      - name: Cache Maven dependencies
+        uses: actions/cache@v5
+        with:
+          path: ${{ env.MAVEN_REPO_LOCAL }}
+          key: windows-cdc-charset-${{ hashFiles('**/pom.xml') }}
+      - name: Build dependency closure
+        shell: pwsh
         run: |
-          gh release download v1.7.11 --repo rhysd/actionlint \
-            --pattern 'actionlint_1.7.11_linux_amd64.tar.gz' --dir "$RUNNER_TEMP"
-          tar -xzf "$RUNNER_TEMP/actionlint_1.7.11_linux_amd64.tar.gz" -C "$RUNNER_TEMP" actionlint
-          "$RUNNER_TEMP/actionlint" -shellcheck= -pyflakes=
-      # The RAT scan takes seconds, so it runs on every change rather than in Licensing.
-      - name: Check PyPaimon licensing
-        run: ./paimon-python/dev/check-licensing.sh
-      - name: Select affected tests and check changed file sizes
-        id: plan
-        run: python3 tools/ci/plan.py
-
-  java:
-    name: Java
-    needs: plan
-    if: needs.plan.outputs.java == 'true'
-    uses: ./.github/workflows/ci-java.yml
-    with:
-      matrix: ${{ needs.plan.outputs.matrix }}
-
-  python:
-    name: Python
-    needs: plan
-    if: needs.plan.outputs.python == 'true'
-    uses: ./.github/workflows/ci-python.yml
-
-  docs:
-    name: Documentation
-    needs: plan
-    if: needs.plan.outputs.docs == 'true'
-    uses: ./.github/workflows/ci-docs.yml
-
-  licensing:
-    name: Licensing
-    needs: plan
-    if: needs.plan.outputs.licensing == 'true'
-    uses: ./.github/workflows/ci-licensing.yml
-
-  result:
-    # Use this stable check for branch protection, not individual matrix jobs.
-    name: CI result
-    if: always()
-    needs: [plan, java, python, docs, licensing]
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - name: Require all selected jobs to pass
-        env:
-          RESULTS: ${{ toJSON(needs) }}
-        run: |
-          python3 - <<'PYTHON'
-          import json
-          import os
-          results = json.loads(os.environ['RESULTS'])
-          if results['plan']['result'] != 'success':
-              raise SystemExit('CI selection or validation failed')
-          selected = results['plan']['outputs']
-          for name in ('java', 'python', 'docs', 'licensing'):
-              expected = 'success' if selected[name] == 'true' else 'skipped'
-              if results[name]['result'] != expected:
-                  raise SystemExit(name + ': ' + results[name]['result'] + ', expected ' + expected)
-          PYTHON
+          New-Item -ItemType Directory -Force windows-validation-results | Out-Null
+          java -version
+          mvn -version
+          & mvn.cmd -B -ntp -T 2 "-Dmaven.repo.local=$env:MAVEN_REPO_LOCAL" `
+            -pl paimon-flink/paimon-flink-cdc -am '-Pfast-build,flink1' `
+            -DskipTests install 2>&1 | Tee-Object windows-validation-results/build.log
+          if ($LASTEXITCODE -ne 0) { throw "Dependency build failed: $LASTEXITCODE" }
+      - name: Compare old and new launcher on JDK 8
+        shell: pwsh
+        run: ./.github/scripts/verify-cdc-windows.ps1 -JavaVersion 8
+      - name: Set up JDK 11
+        uses: actions/setup-java@v5
+        with:
+          java-version: '11'
+          distribution: temurin
+      - name: Compare old and new launcher on JDK 11
+        shell: pwsh
+        run: ./.github/scripts/verify-cdc-windows.ps1 -JavaVersion 11
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: windows-cdc-charset-evidence
+          path: windows-validation-results/
+          retention-days: 7
