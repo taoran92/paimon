@@ -702,6 +702,13 @@ class PythonTableRead:
             auth_result = split.auth_result
             split = split.split
 
+        from pypaimon.read.fallback_split import FallbackSplit
+        if isinstance(split, FallbackSplit):
+            if split.is_fallback:
+                raise NotImplementedError(
+                    "Reading a fallback-branch split requires the Native reader")
+            split = split.split
+
         if auth_result is not None:
             return self._authed_reader(
                 split, auth_result, blob_parallelism, limit)

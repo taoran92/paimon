@@ -33,6 +33,7 @@ from pypaimon.manifest.schema.data_file_meta import DataFileMeta
 from pypaimon.manifest.schema.simple_stats import SimpleStats
 from pypaimon.read.split import DataSplit, Split
 from pypaimon.read.query_auth_split import QueryAuthSplit
+from pypaimon.read.fallback_split import FallbackSplit
 from pypaimon.schema.data_types import AtomicType, DataField
 from pypaimon.table.row.binary_row import BinaryRow
 from pypaimon.table.row.generic_row import (
@@ -47,6 +48,8 @@ _SPLIT_SER_VERSION = 1
 _TYPE_DATA_SPLIT = 1
 _TYPE_INDEXED_SPLIT = 3
 _TYPE_QUERY_AUTH_SPLIT = 5
+_TYPE_FALLBACK_DATA_SPLIT = 6
+_TYPE_FALLBACK_SPLIT = 7
 _INDEXED_SPLIT_MAGIC = -938472394838495695
 _INDEXED_SPLIT_VERSION = 1
 _SPLIT_MAGIC = -2394839472490812314
@@ -297,6 +300,15 @@ def serialize_split_v1(split: Split, include_scores: bool = True) -> bytes:
         writer.i32(_TYPE_QUERY_AUTH_SPLIT)
         writer.take(serialize_split_v1(split.split, include_scores))
         _write_auth_result(writer, split.auth_result)
+    elif isinstance(split, FallbackSplit):
+        if isinstance(split.split, DataSplit):
+            writer.i32(_TYPE_FALLBACK_DATA_SPLIT)
+            _write_datasplit_body(writer, split.split)
+            writer.u8(int(split.is_fallback))
+        else:
+            writer.i32(_TYPE_FALLBACK_SPLIT)
+            writer.u8(int(split.is_fallback))
+            writer.take(serialize_split_v1(split.split, include_scores))
     elif isinstance(split, IndexedSplit):
         data_split = split.data_split()
         if not isinstance(data_split, DataSplit):
@@ -580,6 +592,13 @@ def _read_split_frame(r, partition_fields, key_fields, depth=0):
         split = QueryAuthSplit(
             _read_split_frame(r, partition_fields, key_fields, depth + 1),
             _read_auth_result(r))
+    elif type_id == _TYPE_FALLBACK_DATA_SPLIT:
+        base = _read_datasplit_body(r, partition_fields, key_fields)
+        split = FallbackSplit(base, bool(r.u8()))
+    elif type_id == _TYPE_FALLBACK_SPLIT:
+        is_fallback = bool(r.u8())
+        split = FallbackSplit(
+            _read_split_frame(r, partition_fields, key_fields, depth + 1), is_fallback)
     elif type_id == _TYPE_DATA_SPLIT:
         split = _read_datasplit_body(r, partition_fields, key_fields)
     elif type_id == _TYPE_INDEXED_SPLIT:

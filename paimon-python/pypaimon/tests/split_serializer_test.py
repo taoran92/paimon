@@ -402,3 +402,41 @@ class SplitSerializerTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class FallbackSplitSerializerTest(unittest.TestCase):
+    def test_fallback_frames_preserve_branch_and_selection(self):
+        import pickle
+        from pypaimon.read.fallback_split import FallbackSplit
+
+        fields = [DataField(0, 'year', AtomicType('INT')),
+                  DataField(1, 'month', AtomicType('INT'))]
+        for golden, type_id in ((_GOLDEN_DATA_SPLIT_V1, 6),
+                                (_GOLDEN_INDEXED_SPLIT_V1, 7)):
+            original = deserialize_split_v1(golden, fields)
+            for fallback in (False, True):
+                wrapped = FallbackSplit(original, fallback)
+                payload = serialize_split_v1(wrapped)
+                self.assertEqual(struct.unpack('>i', payload[12:16])[0], type_id)
+                decoded = deserialize_split_v1(payload, fields)
+                self.assertEqual(decoded.is_fallback, fallback)
+                self.assertEqual(decoded.row_count, original.row_count)
+                self.assertEqual(serialize_split_v1(decoded.split),
+                                 serialize_split_v1(original))
+                self.assertEqual(serialize_split_v1(pickle.loads(pickle.dumps(decoded))), payload)
+                self.assertEqual(serialize_split_v1(decoded), payload)
+
+    def test_indexed_fallback_is_normalized_for_native_transport(self):
+        from pypaimon.execution.native.read.split_adapter import _native_read_split
+        from pypaimon.read.fallback_split import FallbackSplit
+        from pypaimon.utils.range import Range
+
+        fields = [DataField(0, 'year', AtomicType('INT')),
+                  DataField(1, 'month', AtomicType('INT'))]
+        base = deserialize_split_v1(_GOLDEN_DATA_SPLIT_V1, fields)
+        selected = IndexedSplit(FallbackSplit(base, True), [Range(1, 2)])
+        normalized = _native_read_split(selected, False)
+        self.assertIsInstance(normalized, FallbackSplit)
+        restored = deserialize_split_v1(serialize_split_v1(normalized), fields)
+        self.assertTrue(restored.is_fallback)
+        self.assertEqual([(r.from_, r.to) for r in restored.split.row_ranges()], [(1, 2)])

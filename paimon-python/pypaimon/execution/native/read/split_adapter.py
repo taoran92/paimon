@@ -24,22 +24,29 @@ def _native_read_split(split, ranges_use_row_ids):
     """Express Python's file slices with the existing indexed-split selector."""
     from pypaimon.globalindex.indexed_split import IndexedSplit
     from pypaimon.read.query_auth_split import QueryAuthSplit
+    from pypaimon.read.fallback_split import FallbackSplit
     from pypaimon.read.sliced_split import SlicedSplit
     from pypaimon.utils.range import Range
 
     def select_rows(base, ranges):
+        if isinstance(base, FallbackSplit):
+            return FallbackSplit(select_rows(base.split, ranges), base.is_fallback)
         if isinstance(base, QueryAuthSplit):
             return QueryAuthSplit(select_rows(base.split, ranges), base.auth_result)
         if isinstance(base, IndexedSplit):
             return select_rows(base.data_split(), Range.and_(base.row_ranges(), ranges))
         return IndexedSplit(base, ranges)
 
+    if isinstance(split, FallbackSplit):
+        base = _native_read_split(split.split, ranges_use_row_ids)
+        return split if base is split.split else FallbackSplit(base, split.is_fallback)
     if isinstance(split, QueryAuthSplit):
         base = _native_read_split(split.split, ranges_use_row_ids)
         return split if base is split.split else QueryAuthSplit(base, split.auth_result)
     if isinstance(split, IndexedSplit):
         base = _native_read_split(split.data_split(), ranges_use_row_ids)
-        return split if base is split.data_split() else select_rows(base, split.row_ranges())
+        return (split if base is split.data_split() and not isinstance(base, FallbackSplit)
+                else select_rows(base, split.row_ranges()))
     if not isinstance(split, SlicedSplit):
         return split
     if ranges_use_row_ids is None:
