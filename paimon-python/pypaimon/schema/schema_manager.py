@@ -180,6 +180,134 @@ def _get_rename_mappings(changes: List[SchemaChange]) -> dict:
     return rename_mappings
 
 
+def _is_partial_update_table(primary_keys: List[str], options: dict) -> bool:
+    from pypaimon.common.options.core_options import MergeEngine
+
+    return bool(primary_keys) and CoreOptions.from_dict(options).merge_engine() == MergeEngine.PARTIAL_UPDATE
+
+
+def _field_aggregation_keys(name: str):
+    for suffix in ("aggregate-function", "ignore-retract", CoreOptions.LIST_AGG_DELIMITER, CoreOptions.DISTINCT,
+                   CoreOptions.SUM_FAIL_ON_OVERFLOW, CoreOptions.PRODUCT_FAIL_ON_OVERFLOW,
+                   CoreOptions.MERGE_MAP_TS_FIELD, CoreOptions.MERGE_MAP_OVERWRITE_ON_EQUAL_TS,
+                   CoreOptions.NESTED_KEY, CoreOptions.NESTED_SEQUENCE_FIELD,
+                   CoreOptions.NESTED_KEY_NULL_STRATEGY, CoreOptions.COUNT_LIMIT):
+        yield f"{CoreOptions.FIELDS_PREFIX}.{name}.{suffix}"
+
+
+_GROUP_DELETE_OPTION = "partial-update.remove-record-on-sequence-group"
+
+
+def _group_field_references(key: str, value):
+    """Yield literal (Java) and trimmed (DataFusion) field names at each list position."""
+    prefix, suffix = CoreOptions.FIELDS_PREFIX + ".", ".sequence-group"
+    if key.endswith(suffix + ".sort-order"):
+        key = key[:-len(".sort-order")]
+        value = None  # Only the ordering columns in the key are field references.
+    ordering_fields = None
+    if key.startswith(prefix) and key.endswith(suffix):
+        ordering_fields = key[len(prefix):-len(suffix)]
+    elif key != _GROUP_DELETE_OPTION:
+        return
+    for part, names in (("key", ordering_fields), ("value", value)):
+        if isinstance(names, str):
+            for index, name in enumerate(names.split(",")):
+                yield (part, index), name
+                trimmed = name.strip()
+                if trimmed != name:
+                    yield (part, index), trimmed
+
+
+def _rename_partial_update_options(options: dict, old: str, new: str, field_names: set,
+                                   agg_option_changes: dict, dropped_group_refs: dict):
+    def rename_fields(names: str) -> str:
+        fields = names.split(",")
+        for i, field in enumerate(fields):
+            stripped = field.strip()
+            if old not in (field, stripped):
+                continue
+            # Java uses the literal name while DataFusion trims the list entry.
+            if field != stripped and field in field_names and stripped in field_names:
+                raise ValueError(f"Cannot rename {old!r}: sequence-group field {field!r} is ambiguous "
+                                 f"because the schema also contains {stripped!r}.")
+            if not new or new != new.strip() or "," in new:
+                raise ValueError(f"Cannot represent column {new!r} in a sequence-group field list.")
+            fields[i] = new
+        return ",".join(fields)
+
+    def rename_key(key: str, new_key: str):
+        if new_key == key:
+            return
+        if new_key in options:
+            raise ValueError(f"Cannot rename '{key}' to '{new_key}': target already configured.")
+        options[new_key] = options.pop(key)
+        if key in dropped_group_refs:
+            dropped_group_refs[new_key] = dropped_group_refs.pop(key)
+
+    delete_groups = options.get(_GROUP_DELETE_OPTION)
+    if isinstance(delete_groups, str):
+        options[_GROUP_DELETE_OPTION] = rename_fields(delete_groups)
+
+    for key, new_key in zip(_field_aggregation_keys(old), _field_aggregation_keys(new)):
+        # A re-added column only owns options explicitly set after the previous column was dropped.
+        if isinstance(agg_option_changes.pop(key, None), DropColumn):
+            options.pop(key, None)
+        last_change = agg_option_changes.pop(new_key, None)
+        if key in options:
+            rename_key(key, new_key)
+        elif new_key in options:
+            if isinstance(last_change, DropColumn):
+                del options[new_key]
+            elif not isinstance(last_change, SetOption):
+                raise ValueError(f"Cannot rename {old!r} to {new!r}: target already configured with {new_key!r}.")
+
+    prefix = CoreOptions.FIELDS_PREFIX + "."
+    group = ".sequence-group"
+    order = group + ".sort-order"
+    for key, value in list(options.items()):
+        if not key.startswith(prefix) or not key.endswith((group, order)):
+            continue
+        suffix = group if key.endswith(group) else order
+        ordering_fields = key[len(prefix):-len(suffix)]
+        if not ordering_fields:
+            continue
+        new_key = prefix + rename_fields(ordering_fields) + suffix
+        rename_key(key, new_key)
+        # Group values name protected columns. Sort-order values are literals.
+        if suffix == group and isinstance(value, str):
+            options[new_key] = rename_fields(value)
+
+
+def _validate_renamed_group_ownership(schema: Schema, renamed_field_ids: set, dropped_group_refs: dict):
+    if not _is_partial_update_table(schema.primary_keys, schema.options):
+        return
+
+    renamed_fields = {field.name for field in schema.fields if field.id in renamed_field_ids}
+    ordering_owners = {}
+    protected_owners = {}
+    for key, value in schema.options.items():
+        if not key.endswith(".sequence-group") or not isinstance(value, str):
+            continue
+        for (part, _), name in _group_field_references(key, value):
+            if name not in renamed_fields:
+                continue
+            if part == "key":
+                previous = ordering_owners.setdefault(name, key)
+                if previous != key:
+                    raise ValueError(f"Ordering field {name!r} is shared by sequence groups {previous!r} and {key!r}.")
+            elif name in protected_owners:
+                raise ValueError(
+                    f"Field {name!r} is protected more than once in sequence-group definitions "
+                    f"({protected_owners[name]!r}, {key!r}).")
+            else:
+                protected_owners[name] = key
+
+    for key, dropped_positions in dropped_group_refs.items():
+        for position, name in _group_field_references(key, schema.options[key]):
+            if position in dropped_positions and name in renamed_fields:
+                raise ValueError(f"Renamed field {name!r} would inherit a dropped field's role in {key!r}.")
+
+
 def _handle_update_column_default_value(
     change: UpdateColumnDefaultValue, new_fields: List[DataField]
 ):
@@ -858,7 +986,9 @@ def _contains_blob_type(data_type: DataType) -> bool:
     return False
 
 
-def _handle_rename_column(change: RenameColumn, new_fields: List[DataField]):
+def _handle_rename_column(change: RenameColumn, new_fields: List[DataField], new_options: dict,
+                          primary_keys: List[str], renamed_field_ids: set, agg_option_changes: dict,
+                          dropped_group_refs: dict):
     new_name = change.new_name
 
     def update_last(depth, fields, field_name):
@@ -868,6 +998,10 @@ def _handle_rename_column(change: RenameColumn, new_fields: List[DataField]):
         if _find_field_index(fields, new_name) is not None:
             raise ColumnAlreadyExistException(new_name)
         field = fields[field_index]
+        if len(change.field_names) == 1 and _is_partial_update_table(primary_keys, new_options):
+            _rename_partial_update_options(new_options, field_name, new_name,
+                                           {f.name for f in fields}, agg_option_changes, dropped_group_refs)
+            renamed_field_ids.add(field.id)
         fields[field_index] = DataField(
             field.id, new_name, field.type, field.description, field.default_value
         )
@@ -1164,6 +1298,9 @@ class SchemaManager:
     ) -> TableSchema:
         old_options = dict(old_table_schema.options)
         new_options = dict(old_table_schema.options)
+        renamed_field_ids = set()
+        agg_option_changes = {}
+        dropped_group_refs = {}
         new_fields = []
         for field in old_table_schema.fields:
             from pypaimon.schema.data_types import DataTypeParser
@@ -1204,12 +1341,21 @@ class SchemaManager:
 
         for change in changes:
             if isinstance(change, SetOption):
+                # An explicit SET after DROP applies to the reused name, even with the same value.
+                agg_option_changes[change.key] = change
                 # compare against the accumulated options so repeated changes to
                 # the same key in one batch apply in order
                 old_value = new_options.get(change.key)
                 unchanged = (_option_text(old_value) == _option_text(change.value)
                              or _is_unchanged_normalized_key(
                                  change.key, old_value, change.value, old_table_schema))
+                # SET rebinds the value (including an explicit sort direction), but not a group's ordering columns.
+                # Replaying an immutable delete option is a no-op.
+                if change.key in dropped_group_refs and (change.key != _GROUP_DELETE_OPTION or not unchanged):
+                    dropped_group_refs[change.key] = {
+                        pos for pos in dropped_group_refs[change.key]
+                        if pos[0] == "key" and change.key.endswith(".sequence-group")
+                    }
                 if unchanged:
                     continue
                 # the type decides the table implementation, and table kinds like
@@ -1228,6 +1374,7 @@ class SchemaManager:
                 if _has_snapshots():
                     _check_reset_table_option(old_options, change.key)
                 new_options.pop(change.key, None)
+                dropped_group_refs.pop(change.key, None)
             elif isinstance(change, UpdateComment):
                 new_comment = change.comment
             elif isinstance(change, AddColumn):
@@ -1241,10 +1388,20 @@ class SchemaManager:
                     old_table_schema, change.field_names, "rename"
                 )
                 _assert_not_renaming_blob_column(new_fields, change.field_names)
-                _handle_rename_column(change, new_fields)
+                _handle_rename_column(change, new_fields, new_options, old_table_schema.primary_keys,
+                                      renamed_field_ids, agg_option_changes, dropped_group_refs)
             elif isinstance(change, DropColumn):
                 _drop_column_validation(old_table_schema, change)
                 _handle_drop_column(change, new_fields, new_options)
+                if len(change.field_names) == 1:
+                    dropped_name = change.field_names[0]
+                    agg_option_changes.update((key, change) for key in _field_aggregation_keys(dropped_name)
+                                              if key in new_options)
+                    # Renames preserve list positions, even when two names end up spelled alike.
+                    for key, value in new_options.items():
+                        positions = {pos for pos, name in _group_field_references(key, value) if name == dropped_name}
+                        if positions:
+                            dropped_group_refs.setdefault(key, set()).update(positions)
             elif isinstance(change, UpdateColumnType):
                 _assert_not_updating_partition_keys(
                     old_table_schema, change.field_names, "update"
@@ -1283,6 +1440,9 @@ class SchemaManager:
             options=new_options,
             comment=new_comment
         )
+        # A later change in the same ALTER may remove a conflicting group.
+        if renamed_field_ids:
+            _validate_renamed_group_ownership(new_schema, renamed_field_ids, dropped_group_refs)
         # Java's Schema runs the same checks when an alter builds it, which
         # rejects, for example, renaming a primary key twice in one alter.
         _validate_columns_and_keys(new_schema)

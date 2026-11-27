@@ -625,6 +625,63 @@ class TestOptionValidation(unittest.TestCase):
         manager.commit_changes([RemoveOption(group), RemoveOption(order)])
         self.assertNotIn(order, manager.latest().options)
 
+    def test_rename_sequence_group_columns(self):
+        group = "fields.ts, offset.sequence-group"
+        for direction in (None, "ascending"):
+            with self.subTest(direction=direction):
+                options = {group: "channel, ascending"}
+                if direction:
+                    options[group + ".sort-order"] = direction
+                schema = self._group_schema(options)
+                schema.fields.append(DataField(4, "ascending", AtomicType("INT")))
+                manager = SchemaManager(self.file_io, f"{self.table_path}_{direction}")
+                manager.create_table(schema)
+
+                manager.commit_changes([SchemaChange.rename_column("offset", "position"),
+                                        SchemaChange.rename_column("ascending", "source")])
+
+                expected = {"fields.ts,position.sequence-group": "channel,source"}
+                if direction:
+                    expected["fields.ts,position.sequence-group.sort-order"] = direction
+                stored = SchemaManager(self.file_io, manager.table_path).latest()
+                self.assertEqual({k: v for k, v in stored.options.items() if k.startswith("fields.")},
+                                 expected)
+
+    def test_rename_keeps_aggregation_explicitly_set_after_drop(self):
+        manager = SchemaManager(self.file_io, self.table_path)
+        key = "fields.channel.aggregate-function"
+        group = "fields.ts.sequence-group"
+        manager.create_table(self._group_schema({group: "channel", key: "sum"}))
+        manager.commit_changes([SchemaChange.drop_column("channel"), SetOption(key, "sum"),
+                                SchemaChange.rename_column("offset", "channel"), SetOption(group, "channel")])
+        self.assertEqual(manager.latest().options[key], "sum")
+
+    def test_rename_preserves_sequence_group_on_conflict(self):
+        manager = SchemaManager(self.file_io, self.table_path)
+        schema = self._group_schema({
+            "fields.ts.sequence-group": "channel",
+            "fields.offset.sequence-group": "label",
+            "fields.channel.aggregate-function": "sum",
+            "fields.channel.ignore-retract": "true",
+        })
+        schema.fields.append(DataField(4, "label", AtomicType("INT")))
+        original = manager.create_table(schema)
+        for changes, message in [
+            ([SchemaChange.rename_column("channel", "first,second")], "sequence-group field list"),
+            ([SchemaChange.drop_column("offset"),
+              SchemaChange.rename_column("ts", "offset")], "target already configured"),
+            ([SetOption("fields.total.aggregate-function", "max"),
+              SchemaChange.rename_column("channel", "total")], "target already configured"),
+            ([SetOption("fields.total.ignore-retract", "false"),
+              SchemaChange.rename_column("channel", "total")], "target already configured"),
+        ]:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(ValueError, message):
+                    manager.commit_changes(changes)
+                stored = SchemaManager(self.file_io, self.table_path).latest()
+                self.assertEqual(stored.id, original.id)
+                self.assertEqual(stored.options, original.options)
+
 
 class TestAlterTableOptions(unittest.TestCase):
 
